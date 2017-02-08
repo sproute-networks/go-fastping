@@ -56,6 +56,7 @@ const (
 	TimeSliceLength  = 8
 	ProtocolICMP     = 1
 	ProtocolIPv6ICMP = 58
+	PeriodicitySecs  = 20 * time.Second
 )
 
 var (
@@ -129,6 +130,7 @@ type Pinger struct {
 	seq int
 	// key string is IPAddr.String()
 	addrs   map[string]*net.IPAddr
+	ifName  string
 	network string
 	source  string
 	source6 string
@@ -139,10 +141,14 @@ type Pinger struct {
 
 	// Size in bytes of the payload to send
 	Size int
+
 	// Number of (nano,milli)seconds of an idle timeout. Once it passed,
-	// the library calls an idle callback function. It is also used for an
-	// interval time of RunLoop() method
+	// the library calls an idle callback function.
 	MaxRTT time.Duration
+
+	// Amount of time to wait before sending the next ping set.
+	Periodicity time.Duration
+
 	// OnRecv is called with a response packet's source address and its
 	// elapsed time when Pinger receives a response packet.
 	OnRecv func(*net.IPAddr, time.Duration)
@@ -156,20 +162,26 @@ type Pinger struct {
 func NewPinger() *Pinger {
 	rand.Seed(time.Now().UnixNano())
 	return &Pinger{
-		id:      rand.Intn(0xffff),
-		seq:     rand.Intn(0xffff),
-		addrs:   make(map[string]*net.IPAddr),
-		network: "ip",
-		source:  "",
-		source6: "",
-		hasIPv4: false,
-		hasIPv6: false,
-		Size:    TimeSliceLength,
-		MaxRTT:  time.Second,
-		OnRecv:  nil,
-		OnIdle:  nil,
-		Debug:   false,
+		id:          rand.Intn(0xffff),
+		seq:         rand.Intn(0xffff),
+		addrs:       make(map[string]*net.IPAddr),
+		network:     "ip",
+		source:      "",
+		source6:     "",
+		hasIPv4:     false,
+		hasIPv6:     false,
+		Size:        TimeSliceLength,
+		Periodicity: PeriodicitySecs,
+		MaxRTT:      time.Second,
+		OnRecv:      nil,
+		OnIdle:      nil,
+		Debug:       false,
+		ifName:      "",
 	}
+}
+
+func (p *Pinger) SetIfName(ifName string) {
+	p.ifName = ifName
 }
 
 // Network sets a network endpoints for ICMP ping and returns the previous
@@ -386,7 +398,7 @@ func (p *Pinger) Err() error {
 }
 
 func (p *Pinger) listen(netProto string, source string) *icmp.PacketConn {
-	conn, err := icmp.ListenPacket(netProto, source)
+	conn, err := icmp.IfListenPacket(p.ifName, netProto, source)
 	if err != nil {
 		p.mu.Lock()
 		p.ctx.err = err
@@ -432,7 +444,8 @@ func (p *Pinger) run(once bool) {
 	p.debugln("Run(): call sendICMP()")
 	queue, err := p.sendICMP(conn, conn6)
 
-	ticker := time.NewTicker(p.MaxRTT)
+	timer := time.NewTimer(p.MaxRTT)
+	rttWaiting := true
 
 mainloop:
 	for {
@@ -446,25 +459,39 @@ mainloop:
 			err = recvCtx.err
 			p.mu.Unlock()
 			break mainloop
-		case <-ticker.C:
-			p.mu.Lock()
-			handler := p.OnIdle
-			p.mu.Unlock()
-			if handler != nil {
-				handler()
+		case <-timer.C:
+			if rttWaiting {
+				rttWaiting = false
+
+				// Waiting for ICMP responses
+				p.mu.Lock()
+				handler := p.OnIdle
+				p.mu.Unlock()
+				if handler != nil {
+					handler()
+				}
+				if once || err != nil {
+					break mainloop
+				}
+				p.mu.Lock()
+				timer.Reset(p.Periodicity)
+				p.mu.Unlock()
+			} else {
+
+				rttWaiting = true
+				p.mu.Lock()
+				timer.Reset(p.MaxRTT)
+				p.mu.Unlock()
+				p.debugln("Run(): call sendICMP()")
+				queue, err = p.sendICMP(conn, conn6)
 			}
-			if once || err != nil {
-				break mainloop
-			}
-			p.debugln("Run(): call sendICMP()")
-			queue, err = p.sendICMP(conn, conn6)
 		case r := <-recv:
 			p.debugln("Run(): <-recv")
 			p.procRecv(r, queue)
 		}
 	}
 
-	ticker.Stop()
+	timer.Stop()
 
 	p.debugln("Run(): close(recvCtx.stop)")
 	close(recvCtx.stop)
