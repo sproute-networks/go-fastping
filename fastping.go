@@ -398,9 +398,8 @@ func (p *Pinger) Err() error {
 }
 
 func (p *Pinger) listen(netProto string, source string) *icmp.PacketConn {
-	// TODO: Rajesh to restore this instead of icmp.ListenPacket
-	// conn, err := icmp.IfListenPacket(p.ifName, netProto, source)
-	conn, err := icmp.ListenPacket(netProto, source)
+	conn, err := icmp.IfListenPacket(p.ifName, netProto, source)
+	//conn, err := icmp.ListenPacket(netProto, source)
 	if err != nil {
 		p.mu.Lock()
 		p.ctx.err = err
